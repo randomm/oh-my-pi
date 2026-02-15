@@ -70,6 +70,12 @@ const createTaskSchema = (options: { isolationEnabled: boolean }) => {
 			description:
 				"Tasks to execute in parallel. Each must be small-scoped (3-5 files max) and self-contained given context + assignment.",
 		}),
+		async: Type.Optional(
+			Type.Boolean({
+				description:
+					"Fire-and-forget mode: returns a task ID immediately. Results auto-deliver via notification when complete. Default false (blocking). Requires active session (does not survive session restarts). Parent exit cancels all async tasks.",
+			}),
+		),
 	};
 
 	if (options.isolationEnabled) {

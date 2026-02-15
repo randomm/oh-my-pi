@@ -72,8 +72,10 @@ import type { PlanModeState } from "../plan-mode/state";
 import planModeActivePrompt from "../prompts/system/plan-mode-active.md" with { type: "text" };
 import planModeReferencePrompt from "../prompts/system/plan-mode-reference.md" with { type: "text" };
 import ttsrInterruptTemplate from "../prompts/system/ttsr-interrupt.md" with { type: "text" };
+import asyncTaskCompleteTemplate from "../prompts/tools/async-task-complete.md" with { type: "text" };
 import { closeAllConnections } from "../ssh/connection-manager";
 import { unmountAll } from "../ssh/sshfs-mount";
+import type { TaskRegistry } from "../task/registry";
 import { outputMeta } from "../tools/output-meta";
 import { resolveToCwd } from "../tools/path-utils";
 import type { TodoItem } from "../tools/todo-write";
@@ -340,6 +342,7 @@ export class AgentSession {
 	#streamingEditCheckedLineCounts = new Map<string, number>();
 	#streamingEditFileCache = new Map<string, string>();
 	#promptInFlight = false;
+	#promptGeneration = 0;
 	#providerSessionState = new Map<string, ProviderSessionState>();
 
 	constructor(config: AgentSessionConfig) {
@@ -400,6 +403,11 @@ export class AgentSession {
 		}
 	}
 
+	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
+		await this.#emitExtensionEvent(event);
+		this.#emit(event);
+	}
+
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
 
@@ -424,11 +432,7 @@ export class AgentSession {
 			}
 		}
 
-		// Emit to extensions first
-		await this.#emitExtensionEvent(event);
-
-		// Notify all listeners
-		this.#emit(event);
+		await this.#emitSessionEvent(event);
 
 		if (event.type === "turn_start") {
 			this.#resetStreamingEditState();
@@ -453,11 +457,11 @@ export class AgentSession {
 					this.#ttsrManager.markInjected(matches);
 					// Store for injection on retry
 					this.#pendingTtsrInjections.push(...matches);
-					// Emit TTSR event before aborting (so UI can handle it)
+					// Abort the stream immediately — do not gate on extension callbacks
 					this.#ttsrAbortPending = true;
-					this.#emit({ type: "ttsr_triggered", rules: matches });
-					// Abort the stream
 					this.agent.abort();
+					// Notify extensions (fire-and-forget, does not block abort)
+					this.#emitSessionEvent({ type: "ttsr_triggered", rules: matches }).catch(() => {});
 					// Schedule retry after a short delay
 					setTimeout(async () => {
 						this.#ttsrAbortPending = false;
@@ -525,8 +529,12 @@ export class AgentSession {
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
 				const assistantMsg = event.message as AssistantMessage;
-				if (assistantMsg.stopReason !== "error" && this.#retryAttempt > 0) {
-					this.#emit({
+				if (
+					assistantMsg.stopReason !== "error" &&
+					assistantMsg.stopReason !== "aborted" &&
+					this.#retryAttempt > 0
+				) {
+					await this.#emitSessionEvent({
 						type: "auto_retry_end",
 						success: true,
 						attempt: this.#retryAttempt,
@@ -537,11 +545,13 @@ export class AgentSession {
 			}
 
 			if (event.message.role === "toolResult") {
-				const { toolName, $normative, toolCallId, details } = event.message as {
+				const { toolName, $normative, toolCallId, details, isError, content } = event.message as {
 					toolName?: string;
 					toolCallId?: string;
 					details?: { path?: string };
 					$normative?: Record<string, unknown>;
+					isError?: boolean;
+					content?: Array<TextContent | ImageContent>;
 				};
 				if ($normative && toolCallId && this.settings.get("normativeRewrite")) {
 					await this.#rewriteToolCallArgs(toolCallId, $normative);
@@ -549,6 +559,25 @@ export class AgentSession {
 				// Invalidate streaming edit cache when edit tool completes to prevent stale data
 				if (toolName === "edit" && details?.path) {
 					this.#invalidateFileCacheForPath(details.path);
+				}
+				if (toolName === "todo_write" && isError) {
+					const errorText = content?.find(part => part.type === "text")?.text;
+					const reminderText = [
+						"<system_reminder>",
+						"todo_write failed, so todo progress is not visible to the user.",
+						errorText ? `Failure: ${errorText}` : "Failure: todo_write returned an error.",
+						"Fix the todo payload and call todo_write again before continuing.",
+						"</system_reminder>",
+					].join("\n");
+					await this.sendCustomMessage(
+						{
+							customType: "todo-write-error-reminder",
+							content: reminderText,
+							display: false,
+							details: { toolName, errorText },
+						},
+						{ deliverAs: "nextTurn" },
+					);
 				}
 			}
 		}
@@ -823,15 +852,15 @@ export class AgentSession {
 		}
 	}
 
-	/** Emit extension events based on agent events */
-	async #emitExtensionEvent(event: AgentEvent): Promise<void> {
+	/** Emit extension events based on session events */
+	async #emitExtensionEvent(event: AgentSessionEvent): Promise<void> {
 		if (!this.#extensionRunner) return;
-
 		if (event.type === "agent_start") {
 			this.#turnIndex = 0;
 			await this.#extensionRunner.emit({ type: "agent_start" });
 		} else if (event.type === "agent_end") {
 			await this.#extensionRunner.emit({ type: "agent_end", messages: event.messages });
+			await this.#triggerRecursiveCompletionDelivery();
 		} else if (event.type === "turn_start") {
 			const hookEvent: TurnStartEvent = {
 				type: "turn_start",
@@ -848,6 +877,40 @@ export class AgentSession {
 			};
 			await this.#extensionRunner.emit(hookEvent);
 			this.#turnIndex++;
+		} else if (event.type === "auto_compaction_start") {
+			await this.#extensionRunner.emit({ type: "auto_compaction_start", reason: event.reason });
+		} else if (event.type === "auto_compaction_end") {
+			await this.#extensionRunner.emit({
+				type: "auto_compaction_end",
+				result: event.result,
+				aborted: event.aborted,
+				willRetry: event.willRetry,
+				errorMessage: event.errorMessage,
+			});
+		} else if (event.type === "auto_retry_start") {
+			await this.#extensionRunner.emit({
+				type: "auto_retry_start",
+				attempt: event.attempt,
+				maxAttempts: event.maxAttempts,
+				delayMs: event.delayMs,
+				errorMessage: event.errorMessage,
+			});
+		} else if (event.type === "auto_retry_end") {
+			await this.#extensionRunner.emit({
+				type: "auto_retry_end",
+				success: event.success,
+				attempt: event.attempt,
+				finalError: event.finalError,
+			});
+		} else if (event.type === "ttsr_triggered") {
+			await this.#extensionRunner.emit({ type: "ttsr_triggered", rules: event.rules });
+		} else if (event.type === "todo_reminder") {
+			await this.#extensionRunner.emit({
+				type: "todo_reminder",
+				todos: event.todos,
+				attempt: event.attempt,
+				maxAttempts: event.maxAttempts,
+			});
 		}
 	}
 
@@ -896,6 +959,15 @@ export class AgentSession {
 	async dispose(): Promise<void> {
 		await this.sessionManager.flush();
 		await cleanupSshResources();
+
+		const taskTool = this.#toolRegistry.get("task");
+		if (taskTool) {
+			const registry = "registry" in taskTool ? (taskTool as { registry: TaskRegistry }).registry : undefined;
+			if (registry) {
+				registry.cleanup();
+			}
+		}
+
 		for (const state of this.#providerSessionState.values()) {
 			state.close();
 		}
@@ -1342,6 +1414,7 @@ export class AgentSession {
 		options?: Pick<PromptOptions, "toolChoice" | "images">,
 	): Promise<void> {
 		this.#promptInFlight = true;
+		const generation = this.#promptGeneration;
 		try {
 			// Flush any pending bash messages before the new prompt
 			this.#flushPendingBashMessages();
@@ -1387,6 +1460,12 @@ export class AgentSession {
 
 			messages.push(message);
 
+			// Early bail-out: if a newer abort/prompt cycle started during setup,
+			// return before mutating shared state (nextTurn messages, system prompt).
+			if (this.#promptGeneration !== generation) {
+				return;
+			}
+
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this.#pendingNextTurnMessages) {
 				messages.push(msg);
@@ -1428,6 +1507,11 @@ export class AgentSession {
 				} else {
 					this.agent.setSystemPrompt(this.#baseSystemPrompt);
 				}
+			}
+
+			// Bail out if a newer abort/prompt cycle has started since we began setup
+			if (this.#promptGeneration !== generation) {
+				return;
 			}
 
 			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
@@ -1649,6 +1733,95 @@ export class AgentSession {
 	}
 
 	/**
+	 * Deliver async task completion message with auto-wakeup.
+	 * Uses followUp() as the primary delivery mechanism — it always works:
+	 * - When idle: restarts the loop with a new turn
+	 * - When streaming: queues as follow-up for next turn
+	 *
+	 * This avoids race conditions where stream state checks can race with agent
+	 * state transitions. followUp is the safe fallback in all cases.
+	 */
+	async deliverTaskCompletion(text: string): Promise<void> {
+		await this.followUp(text);
+	}
+
+	/**
+	 * Trigger recursive completion delivery if there are undelivered completed tasks.
+	 * Called after a turn completes to process tasks that finished during execution.
+	 *
+	 * Safety measures:
+	 * - Max depth of 5 recursive wakeups (if 5 aren't enough, something is wrong)
+	 * - 100ms cooldown between iterations to prevent tight loops
+	 * - Warns when depth limit is hit with remaining task count
+	 */
+	async #triggerRecursiveCompletionDelivery(): Promise<void> {
+		const taskTool = this.#toolRegistry.get("task");
+		if (!taskTool) return;
+
+		const registry = "registry" in taskTool ? (taskTool as { registry: TaskRegistry }).registry : undefined;
+		if (!registry) return;
+
+		const maxRecursionDepth = 5;
+		let depth = 0;
+
+		while (depth < maxRecursionDepth) {
+			if (this.isStreaming) break;
+
+			const undeliveredTasks = registry.hasUndeliveredCompleted();
+			if (!undeliveredTasks) break;
+
+			const completedTasks = registry.getAndClearCompleted();
+			for (const task of completedTasks) {
+				const duration = task.completedAt ? task.completedAt - task.createdAt : 0;
+				const durationStr = duration > 0 ? ` (${Math.round(duration / 1000)}s)` : "";
+
+				if (task.status === "completed") {
+					const resultCount = task.result?.length ?? 0;
+					const message = renderPromptTemplate(asyncTaskCompleteTemplate, {
+						taskId: task.id,
+						agent: task.agent,
+						status: "completed",
+						duration: durationStr,
+						description: task.description,
+						statusMessage: `completed${durationStr}.`,
+						resultCount: resultCount > 0 ? resultCount : undefined,
+					});
+					await this.deliverTaskCompletion(message);
+				} else if (task.status === "failed") {
+					const message = renderPromptTemplate(asyncTaskCompleteTemplate, {
+						taskId: task.id,
+						agent: task.agent,
+						status: "failed",
+						duration: durationStr,
+						description: task.description,
+						statusMessage: `failed${durationStr}.`,
+						error: task.error ?? "unknown error",
+					});
+					await this.deliverTaskCompletion(message);
+				}
+			}
+
+			depth++;
+
+			// Add cooldown between iterations to prevent tight loops
+			if (depth < maxRecursionDepth && !this.isStreaming) {
+				await Bun.sleep(100);
+			}
+		}
+
+		// Warn if we hit the limit and there are still undelivered tasks
+		if (depth >= maxRecursionDepth && registry.hasUndeliveredCompleted()) {
+			const remaining = registry.getAndClearCompleted();
+			const taskIds = remaining.map(t => t.id).join(", ");
+			logger.warn("Recursive task completion delivery depth limit reached", {
+				remaining: remaining.length,
+				taskIds,
+				maxDepth: maxRecursionDepth,
+			});
+		}
+	}
+
+	/**
 	 * Send a custom message to the session. Creates a CustomMessageEntry.
 	 *
 	 * Handles three cases:
@@ -1797,8 +1970,14 @@ export class AgentSession {
 	 */
 	async abort(): Promise<void> {
 		this.abortRetry();
+		this.#promptGeneration++;
 		this.agent.abort();
 		await this.agent.waitForIdle();
+		// Clear promptInFlight: waitForIdle resolves when the agent loop's finally
+		// block runs (#resolveRunningPrompt), but #promptWithMessage's finally
+		// (#promptInFlight = false) fires on a later microtask. Without this,
+		// isStreaming stays true and a subsequent prompt() throws.
+		this.#promptInFlight = false;
 	}
 
 	/**
@@ -2672,7 +2851,7 @@ Be thorough - include exact file paths, function names, error messages, and tech
 		});
 
 		// Emit event for UI to render notification
-		this.#emit({
+		await this.#emitSessionEvent({
 			type: "todo_reminder",
 			todos: incomplete,
 			attempt: this.#todoReminderCount,
@@ -2743,7 +2922,7 @@ Be thorough - include exact file paths, function names, error messages, and tech
 	async #runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<void> {
 		const compactionSettings = this.settings.getGroup("compaction");
 
-		this.#emit({ type: "auto_compaction_start", reason });
+		await this.#emitSessionEvent({ type: "auto_compaction_start", reason });
 		// Properly abort and null existing controller before replacing
 		if (this.#autoCompactionAbortController) {
 			this.#autoCompactionAbortController.abort();
@@ -2752,13 +2931,23 @@ Be thorough - include exact file paths, function names, error messages, and tech
 
 		try {
 			if (!this.model) {
-				this.#emit({ type: "auto_compaction_end", result: undefined, aborted: false, willRetry: false });
+				await this.#emitSessionEvent({
+					type: "auto_compaction_end",
+					result: undefined,
+					aborted: false,
+					willRetry: false,
+				});
 				return;
 			}
 
 			const availableModels = this.#modelRegistry.getAvailable();
 			if (availableModels.length === 0) {
-				this.#emit({ type: "auto_compaction_end", result: undefined, aborted: false, willRetry: false });
+				await this.#emitSessionEvent({
+					type: "auto_compaction_end",
+					result: undefined,
+					aborted: false,
+					willRetry: false,
+				});
 				return;
 			}
 
@@ -2766,7 +2955,12 @@ Be thorough - include exact file paths, function names, error messages, and tech
 
 			const preparation = prepareCompaction(pathEntries, compactionSettings);
 			if (!preparation) {
-				this.#emit({ type: "auto_compaction_end", result: undefined, aborted: false, willRetry: false });
+				await this.#emitSessionEvent({
+					type: "auto_compaction_end",
+					result: undefined,
+					aborted: false,
+					willRetry: false,
+				});
 				return;
 			}
 
@@ -2786,7 +2980,12 @@ Be thorough - include exact file paths, function names, error messages, and tech
 				})) as SessionBeforeCompactResult | undefined;
 
 				if (hookResult?.cancel) {
-					this.#emit({ type: "auto_compaction_end", result: undefined, aborted: true, willRetry: false });
+					await this.#emitSessionEvent({
+						type: "auto_compaction_end",
+						result: undefined,
+						aborted: true,
+						willRetry: false,
+					});
 					return;
 				}
 
@@ -2914,7 +3113,12 @@ Be thorough - include exact file paths, function names, error messages, and tech
 			}
 
 			if (this.#autoCompactionAbortController.signal.aborted) {
-				this.#emit({ type: "auto_compaction_end", result: undefined, aborted: true, willRetry: false });
+				await this.#emitSessionEvent({
+					type: "auto_compaction_end",
+					result: undefined,
+					aborted: true,
+					willRetry: false,
+				});
 				return;
 			}
 
@@ -2952,7 +3156,7 @@ Be thorough - include exact file paths, function names, error messages, and tech
 				details,
 				preserveData,
 			};
-			this.#emit({ type: "auto_compaction_end", result, aborted: false, willRetry });
+			await this.#emitSessionEvent({ type: "auto_compaction_end", result, aborted: false, willRetry });
 
 			if (!willRetry && compactionSettings.autoContinue !== false) {
 				await this.prompt("Continue if you have next steps.", {
@@ -2980,11 +3184,16 @@ Be thorough - include exact file paths, function names, error messages, and tech
 			}
 		} catch (error) {
 			if (this.#autoCompactionAbortController?.signal.aborted) {
-				this.#emit({ type: "auto_compaction_end", result: undefined, aborted: true, willRetry: false });
+				await this.#emitSessionEvent({
+					type: "auto_compaction_end",
+					result: undefined,
+					aborted: true,
+					willRetry: false,
+				});
 				return;
 			}
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
-			this.#emit({
+			await this.#emitSessionEvent({
 				type: "auto_compaction_end",
 				result: undefined,
 				aborted: false,
@@ -3106,7 +3315,7 @@ Be thorough - include exact file paths, function names, error messages, and tech
 
 		if (this.#retryAttempt > retrySettings.maxRetries) {
 			// Max retries exceeded, emit final failure and reset
-			this.#emit({
+			await this.#emitSessionEvent({
 				type: "auto_retry_end",
 				success: false,
 				attempt: this.#retryAttempt - 1,
@@ -3135,7 +3344,7 @@ Be thorough - include exact file paths, function names, error messages, and tech
 			}
 		}
 
-		this.#emit({
+		await this.#emitSessionEvent({
 			type: "auto_retry_start",
 			attempt: this.#retryAttempt,
 			maxAttempts: retrySettings.maxRetries,
@@ -3162,7 +3371,7 @@ Be thorough - include exact file paths, function names, error messages, and tech
 			const attempt = this.#retryAttempt;
 			this.#retryAttempt = 0;
 			this.#retryAbortController = undefined;
-			this.#emit({
+			await this.#emitSessionEvent({
 				type: "auto_retry_end",
 				success: false,
 				attempt,

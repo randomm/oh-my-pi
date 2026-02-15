@@ -484,6 +484,27 @@ export const SETTINGS_SCHEMA = {
 			submenu: true,
 		},
 	},
+	"task.maxAsyncTasks": {
+		type: "number",
+		default: 15,
+		minimum: 1,
+		maximum: 100,
+		ui: {
+			tab: "tools",
+			label: "Task max async tasks",
+			description: "Maximum concurrent background async tasks per session",
+			submenu: true,
+		},
+	},
+	"task.asyncEnabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			label: "Async tasks",
+			description: "Enable async task execution and companion tools (check_task, list_tasks, cancel_task)",
+		},
+	},
 
 	// ─────────────────────────────────────────────────────────────────────────
 	// Startup settings

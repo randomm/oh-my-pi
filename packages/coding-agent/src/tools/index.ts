@@ -19,10 +19,13 @@ import { AskTool } from "./ask";
 import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
 import { CalculatorTool } from "./calculator";
+import { CancelTaskTool } from "./cancel-task";
+import { CheckTaskTool } from "./check-task";
 import { ExitPlanModeTool } from "./exit-plan-mode";
 import { FetchTool } from "./fetch";
 import { FindTool } from "./find";
 import { GrepTool } from "./grep";
+import { ListTasksTool } from "./list-tasks";
 import { NotebookTool } from "./notebook";
 import { wrapToolsWithMetaNotice } from "./output-meta";
 import { PythonTool } from "./python";
@@ -70,11 +73,22 @@ export { AskTool, type AskToolDetails } from "./ask";
 export { BashTool, type BashToolDetails, type BashToolInput, type BashToolOptions } from "./bash";
 export { BrowserTool, type BrowserToolDetails } from "./browser";
 export { CalculatorTool, type CalculatorToolDetails } from "./calculator";
+export {
+	type CancelTaskDetails,
+	type CancelTaskInput,
+	CancelTaskTool,
+} from "./cancel-task";
+export { type CheckTaskDetails, CheckTaskTool } from "./check-task";
 export { type ExitPlanModeDetails, ExitPlanModeTool } from "./exit-plan-mode";
 export { FetchTool, type FetchToolDetails } from "./fetch";
 export { type FindOperations, FindTool, type FindToolDetails, type FindToolInput, type FindToolOptions } from "./find";
 export { setPreferredImageProvider } from "./gemini-image";
 export { GrepTool, type GrepToolDetails, type GrepToolInput } from "./grep";
+export {
+	type ListTasksDetails,
+	type ListTasksInput,
+	ListTasksTool,
+} from "./list-tasks";
 export { NotebookTool, type NotebookToolDetails } from "./notebook";
 export { PythonTool, type PythonToolDetails, type PythonToolOptions } from "./python";
 export { ReadTool, type ReadToolDetails, type ReadToolInput } from "./read";
@@ -157,6 +171,12 @@ export interface ToolSession {
 	getPlanModeState?: () => PlanModeState | undefined;
 	/** Get compact conversation context for subagents (excludes tool results, system prompts) */
 	getCompactContext?: () => string;
+	/** Task registry for tracking async task execution */
+	taskRegistry?: import("../task/registry").TaskRegistry;
+	/** Callback to deliver a follow-up message after a tool returns (for async task completion) */
+	deliverFollowUp?: (text: string) => void;
+	/** Callback to deliver async task completion with auto-wakeup support */
+	deliverTaskCompletion?: (text: string) => void;
 }
 
 type ToolFactory = (session: ToolSession) => Tool | null | Promise<Tool | null>;
@@ -174,7 +194,12 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	notebook: s => new NotebookTool(s),
 	read: s => new ReadTool(s),
 	browser: s => new BrowserTool(s),
-	task: TaskTool.create,
+	task: s => TaskTool.create(s),
+	check_task: s => (s.settings.get("task.asyncEnabled") && s.taskRegistry ? new CheckTaskTool(s.taskRegistry) : null),
+	cancel_task: s =>
+		s.settings.get("task.asyncEnabled") && s.taskRegistry ? new CancelTaskTool(s.taskRegistry) : null,
+	list_tasks: s =>
+		s.settings.get("task.asyncEnabled") && s.taskRegistry ? new ListTasksTool(s, s.taskRegistry) : null,
 	todo_write: s => new TodoWriteTool(s),
 	fetch: s => new FetchTool(s),
 	web_search: s => new SearchTool(s),

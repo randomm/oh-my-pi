@@ -1,6 +1,29 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Added `abort_and_prompt` RPC command for atomic abort-and-reprompt without race conditions ([#357](https://github.com/can1357/oh-my-pi/pull/357))
+
+### Fixed
+
+- Fixed `session.abort()` not clearing `promptInFlight` flag due to microtask ordering, which blocked subsequent prompts
+
+### Added
+
+- Added async task execution mode with `async: true` parameter for fire-and-forget task dispatch
+- Added `check_task` tool for querying status of background async tasks
+- Added `list_tasks` tool for overview of all running and completed async tasks
+- Added `cancel_task` tool for cancelling running async tasks
+- Added `task.maxAsyncTasks` setting to limit concurrent async tasks (default: 15, range: 1-100)
+- Added TaskRegistry for async task state management with automatic eviction of completed tasks
+- Added follow-up message delivery for async task completion results
+
+### Changed
+
+- Updated task tool to support both blocking (default) and async execution paths
+- Updated settings schema with async task configuration options
+
 
 ## [12.4.0] - 2026-02-14
 ### Changed

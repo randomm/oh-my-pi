@@ -285,12 +285,15 @@ Layered work with dependencies:
 
 Before calling tool, verify:
 - [ ] `context` includes only session-specific info not already in AGENTS.md/context files
-- [ ] Each `assignment` follows assignment template — not one-liner
-- [ ] Each `assignment` includes edge cases / "don’t break" items
-- [ ] Tasks truly parallel (no hidden dependencies)
-- [ ] Scope small, file paths explicit (no globs)
-- [ ] No task runs project-wide build/test/lint — you do after all tasks complete
-- [ ] `schema` used if you expect information
+---
+
+## Async Task Monitoring
+
+When using `async: true`, use these companion tools to monitor progress:
+- **`check_task`**: Query status of a specific async task by ID. Returns status, results, or errors.
+- **`list_tasks`**: List all async tasks in the session with their status.
+
+Results auto-deliver on completion — do NOT poll. Use these tools when you need visibility or when the user asks about task status.
 ---
 
 ## Agents
